@@ -607,7 +607,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # 加载模型和数据集
-    module = importlib.import_module(f"models.my{args.model_name}")
+    module = importlib.import_module(f"models.{args.model_name}")
     eval_model = load_model(args.device, module, args.model_name)
     train_dataset, test_dataset = load_dataset()
 
