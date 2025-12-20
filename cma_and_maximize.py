@@ -1,15 +1,17 @@
 import os
 import random
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 from collections import deque
 
 import importlib
 import numpy as np
 import torch
 from PIL import Image
+from torch import nn
 from torch.utils.data import Dataset
 from tqdm import tqdm
 import argparse
+import torchvision.transforms as transforms
 
 from models import BaseEvalModel
 from utils.attack_tool import (
@@ -21,6 +23,22 @@ from utils.attack_tool import (
     get_img_id_environment_map,
     RoundWithSTE
 )
+
+# 导入特征提取器
+from feature_extractors import (
+    ClipB16FeatureExtractor,
+    ClipL336FeatureExtractor,
+    ClipB32FeatureExtractor,
+    ClipLaionFeatureExtractor,
+)
+
+# 骨干网络名称到模型类的映射
+BACKBONE_MAP = {
+    "L336": ClipL336FeatureExtractor,
+    "B16": ClipB16FeatureExtractor,
+    "B32": ClipB32FeatureExtractor,
+    "Laion": ClipLaionFeatureExtractor,
+}
 
 
 class AttackConfig:
@@ -37,7 +55,9 @@ class AttackConfig:
                  device: int,
                  epsilon: float = 32/255,
                  alpha: float = 1/255,
-                 debug: bool = False):
+                 debug: bool = False,
+                 extractors: Optional[List[nn.Module]] = None,
+                 maximize_weight: float = 0.1):
         self.method = method
         self.target_text = target_text
         self.adversarial_length = adversarial_length
@@ -51,10 +71,12 @@ class AttackConfig:
         self.alpha = alpha
         self.debug = debug
         self.processor = eval_model.processor
+        self.extractors = extractors
+        self.maximize_weight = maximize_weight
 
 
 def attack(config: AttackConfig) -> None:
-    """使用embed_adv方法进行对抗攻击"""
+    """使用embed_adv方法进行对抗攻击，集成maximize损失"""
     _, test_dataset = config.datasets
     test_dataset = get_subset(dataset=test_dataset, frac=config.fraction)
 
@@ -76,7 +98,7 @@ def attack(config: AttackConfig) -> None:
         combined_embeddings = None
         
         # 初始化对抗文本嵌入
-        print("This is embed_adv method")
+        print("This is embed_adv method with maximize loss")
         target_token_ids = config.processor.tokenizer.encode(config.target_text, add_special_tokens=False)
         adversarial_embeddings = config.eval_model.model.get_input_embeddings()(
             torch.tensor(target_token_ids, device=config.device)
@@ -94,6 +116,12 @@ def attack(config: AttackConfig) -> None:
         image_perturbation = torch.zeros_like(input_x_original, device=config.device).requires_grad_(True)
         best_loss = torch.tensor(float('inf'))
         best_attack = None
+        
+        # 如果有特征提取器，初始化原始图像特征
+        original_features = None
+        if config.extractors is not None:
+            with torch.no_grad():
+                original_features = get_embeddings(config.extractors, input_x_original)
 
         # 提示词轮换逻辑
         access_order = list(range(len(total_prompt_list)))
@@ -206,7 +234,17 @@ def attack(config: AttackConfig) -> None:
             # 清除嵌入
             config.eval_model.clear_custom_embeddings()
 
+            # 基础损失
             loss = outputs.loss
+            
+            # 如果有特征提取器，添加maximize损失
+            if config.extractors is not None and original_features is not None:
+                # 获取对抗图像的特征
+                adversarial_features = get_embeddings(config.extractors, input_x)
+                # 计算余弦距离（最大化距离）
+                cos_distance = compute_cosine_distance(adversarial_features, original_features)
+                # 将maximize损失添加到总损失中
+                loss += config.maximize_weight * cos_distance
             
             # 更新扰动参数（原update_perturbations_embed_adv函数的功能）
             # 反向传播
@@ -297,12 +335,26 @@ if __name__ == "__main__":
     parser.add_argument('--alpha', type=float, default=1/255, help='学习率')
     parser.add_argument('--debug', action='store_true', help='启用调试信息')
     
+    # 添加特征提取器相关参数
+    parser.add_argument('--backbones', '-b', type=str, nargs='*', default=[], 
+                       choices=['B16', 'B32', 'L336', 'Laion'],
+                       help='用于maximize损失的特征提取器骨干网络列表')
+    parser.add_argument('--maximize_weight', type=float, default=0.1, 
+                       help='maximize损失的权重')
+    
     args = parser.parse_args()
     
     # 加载模型和数据集
     module = importlib.import_module(f"models.{args.model_name}")
     eval_model = load_model(args.device, module, args.model_name)
     train_dataset, test_dataset = load_dataset()
+    
+    # 加载特征提取器（如果指定了）
+    extractors = None
+    if args.backbones:
+        device_str = f"cuda:{args.device}" if args.device != -1 else "cpu"
+        extractors = load_feature_extractors(args.backbones, device=device_str)
+        print(f"已加载特征提取器: {', '.join(args.backbones)}")
 
     # 创建配置对象
     target_text = "Unknown"
@@ -318,7 +370,9 @@ if __name__ == "__main__":
         device=args.device,
         epsilon=args.epsilon,
         alpha=args.alpha,
-        debug=args.debug
+        debug=args.debug,
+        extractors=extractors,
+        maximize_weight=args.maximize_weight
     )
     
     # 执行攻击
